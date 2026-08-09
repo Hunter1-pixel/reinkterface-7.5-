@@ -45,18 +45,88 @@
 #define PIN_BAT_ADC  1
 #define PIN_BAT_EN   6
 
-// Sparkbox width is tuned so three columns + three 5 px gutters + 5 px left
-// and right margins tile the 800 px wide GDEY075T7 panel exactly:
-// 5 + 260 + 5 + 260 + 5 + 260 + 5 = 800.
-#define SPARKBOX_HEIGHT 150
-#define SPARKBOX_WIDTH  260
-#define DISCRETEBOX_WIDTH 260
+// Layout sizing for the 7.5" 800x480 GDEY075T7 panel.
+// The 5.83" build used 209x100 sparkboxes with size-2 (12 px) text. On the
+// wider, larger 7.5" panel that's undersized for desk-distance viewing, so
+// we scaled up proportionally:
+//   - sparkbox width  209 -> 260 px  (matches 800 / 3 columns + gutters)
+//   - sparkbox height 100 -> 150 px  (1.5x, gives graphs room under title)
+//   - discrete box    26  -> 36 px   (taller to host size-3 text)
+//   - title font      2   -> 3       (12 px -> 18 px)
+//   - top-line font   3   -> 4       (18 px -> 24 px)
+//   - gutter          5   -> 5 px    (kept; panel is wider so absolute
+//                                   gutter already feels roomier)
+//
+// Vertical budget for box rows: 480 - 120 (header) - 14 (bottom margin) = 346 px
+//   discrete(36) + gutter(5) + spark(150) + gutter(5) + spark(150) = 346 px ✓
+//
+// Width math (must tile edge-to-edge):
+//   MARGIN(5) + 260 + GUTTER(5) + 260 + GUTTER(5) + 260 + MARGIN(5) = 800 ✓
+#define SPARKBOX_HEIGHT     150
+#define SPARKBOX_WIDTH      260
+#define DISCRETEBOX_WIDTH   260
+#define DISCRETEBOX_HEIGHT  36
+#define GUTTER              5
+#define MARGIN              5
+// Title bar height inside each box; sparkbox graph area = (height - title_h - 32).
+#define SPARKBOX_TITLE_H    32
 
 #define INTERFACE_VERSION "IFv01"
 #define GIT_REVISION "INKTF 0.1.0"
 
 NimBLEServer *BLE_SERVER = nullptr;
 std::string BLE_NAME = "INKTF";
+
+// Dirty-region tracker.
+//
+// The host BLE frame (status lines / keyvals / vectors / flush) redraws
+// the whole panel, which is the natural way to handle a structural
+// change. But the battery readout updates on its own 5 s timer and the
+// only thing that actually changed is a ~120 x 14 px patch in the
+// bottom-right corner. Forcing a full refresh every 5 s for that is
+// wasteful (~1.2 s flicker every poll) and shortens panel life.
+//
+// Instead we keep a bounding box of "regions that have changed since the
+// last refresh". If the host didn't push anything we may have only the
+// battery patch dirty — in that case we use displayWindow() to do a
+// ~450 ms fast partial refresh of just that rect. If the host pushed a
+// new frame we mark the whole screen dirty and do a fast full refresh.
+struct DirtyRegion {
+    bool     full    = true; // true => redraw entire screen
+    // Partial-rect bounds (x0,y0)..(x1,y1) BOTH inclusive. A rect is
+    // "empty" when x0 > x1 or y0 > y1.
+    int16_t  x0 = 0, y0 = 0;
+    int16_t  x1 = -1, y1 = -1;
+
+    void markFull() {
+        full = true;
+    }
+
+    void markPartial(int16_t rx0, int16_t ry0, int16_t rx1, int16_t ry1) {
+        if (full) {
+            // already going to redraw the whole screen — don't bother
+            // expanding a partial rect.
+            return;
+        }
+        if (empty()) {
+            x0 = rx0; y0 = ry0;
+            x1 = rx1; y1 = ry1;
+        } else {
+            if (rx0 < x0) x0 = rx0;
+            if (ry0 < y0) y0 = ry0;
+            if (rx1 > x1) x1 = rx1;
+            if (ry1 > y1) y1 = ry1;
+        }
+    }
+
+    bool empty() const { return x0 > x1 || y0 > y1; }
+
+    void clear() {
+        full = false;
+        x0 = 0; y0 = 0;
+        x1 = -1; y1 = -1;
+    }
+} DIRTY;
 
 bool INVERTED = false;
 #define FG_COLOR (INVERTED ? GxEPD_WHITE : GxEPD_BLACK)
@@ -235,7 +305,7 @@ void drawSparkbox(int16_t &x, const int16_t &y, std::string &title, const std::s
     const int16_t h = SPARKBOX_HEIGHT;
     const int16_t hpad = 8;
     const int16_t vpad = 6;
-    const int16_t title_h = 26;
+    const int16_t title_h = SPARKBOX_TITLE_H;
     const int16_t graph_h = (h - title_h) - 32;
     const int16_t graph_w = w - 20;
     const int16_t graph_x = x + 10;
@@ -245,18 +315,21 @@ void drawSparkbox(int16_t &x, const int16_t &y, std::string &title, const std::s
         MF_DISPLAY.drawRoundRect(x, y, w, h, 4, FG_COLOR);
         MF_DISPLAY.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 4, FG_COLOR);
         MF_DISPLAY.fillRect(x, y + title_h, w, 1, FG_COLOR);
-        drawText(title.c_str(), x + hpad, y + vpad, 2);
-        drawText(value.c_str(), (x + (w - hpad)) - (12 * strlen(value.c_str())), y + vpad, 2);
+        // Title text bumped to size 3 (18 px) so it reads from desk distance.
+        drawText(title.c_str(), x + hpad, y + vpad, 3);
+        // Value uses size 3; width-per-char for size 3 is ~18 px (vs 12 for size 2).
+        drawText(value.c_str(),
+                 (x + (w - hpad)) - (18 * strlen(value.c_str())), y + vpad, 3);
 
         std::stringstream maxstrm;
         maxstrm << std::fixed << std::setprecision(0) << points.yMax;
         auto maxstr = maxstrm.str();
-        drawText(maxstr.c_str(), x + hpad, y + title_h + vpad);
+        drawText(maxstr.c_str(), x + hpad, y + title_h + vpad, 2);
 
         std::stringstream minstrm;
         minstrm << std::fixed << std::setprecision(0) << points.yMin;
         auto minstr = minstrm.str();
-        drawText(minstr.c_str(), x + hpad, y + h - (vpad + 7));
+        drawText(minstr.c_str(), x + hpad, y + h - (vpad + 7), 2);
 
         if (points.points.size() >= 2) {
             int16_t s_x = 0.0, s_y = 0.0, e_x = 0.0, e_y = 0.0;
@@ -281,15 +354,18 @@ void drawDiscreteBox(int16_t &x, const int16_t &y, const std::string &title,
                      const std::string &value)
 { // {{{
     const int16_t w = DISCRETEBOX_WIDTH;
-    const int16_t h = 26;
+    const int16_t h = DISCRETEBOX_HEIGHT;
     const int16_t hpad = 8;
-    const int16_t vpad = 6;
+    const int16_t vpad = 8;
 
     if (!title.empty()) {
         MF_DISPLAY.drawRoundRect(x, y, w, h, 4, FG_COLOR);
         MF_DISPLAY.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 4, FG_COLOR);
-        drawText(title.c_str(), x + hpad, y + vpad, 2);
-        drawText(value.c_str(), (x + (w - hpad)) - (12 * strlen(value.c_str())), y + vpad, 2);
+        // Size 3 text needs more vertical padding to stay optically centered
+        // in the 36 px box height.
+        drawText(title.c_str(), x + hpad, y + vpad, 3);
+        drawText(value.c_str(),
+                 (x + (w - hpad)) - (18 * strlen(value.c_str())), y + vpad, 3);
     }
 
     x += w;
@@ -301,52 +377,56 @@ void drawStatic()
     int16_t y = 0;
 
     // logo in top left corner
-    x = 5;
-    y = 5;
+    x = MARGIN;
+    y = MARGIN;
     drawLogo(x, y);
 
     // show connected fremont hostname/serial or connecting status
-    x = 120;
-    y = 15;
-    drawText(STATE.topLine.c_str(), x, y, 3);
-    y += 35;
-    drawText(STATE.midLine.c_str(), x, y, 2);
-    y += 30;
-    drawText(STATE.botLine.c_str(), x, y, 2);
+    // Sized for the bigger 7.5" canvas:
+    //   - topline: size 4 (24 px tall) — the headline
+    //   - midline: size 3 (18 px tall) — secondary info
+    //   - botline: size 3 (18 px tall) — tertiary info
+    x = 130;
+    y = 18;
+    drawText(STATE.topLine.c_str(), x, y, 4);
+    y += 32;
+    drawText(STATE.midLine.c_str(), x, y, 3);
+    y += 28;
+    drawText(STATE.botLine.c_str(), x, y, 3);
 
     // first row of boxes with no sparklines
-    x = 5;
-    y = 115;
+    x = MARGIN;
+    y = 120;
     drawDiscreteBox(x, y, STATE.keyvals[0].key, STATE.keyvals[0].val);
-    x += 5;
+    x += GUTTER;
     drawDiscreteBox(x, y, STATE.keyvals[1].key, STATE.keyvals[1].val);
-    x += 5;
+    x += GUTTER;
     drawDiscreteBox(x, y, STATE.keyvals[2].key, STATE.keyvals[2].val);
 
     // second row
-    x = 5;
-    y += 26 + 5;
+    x = MARGIN;
+    y += DISCRETEBOX_HEIGHT + GUTTER;
     drawSparkbox(x, y, STATE.keyvals[3].key, STATE.keyvals[3].val, STATE.sparks[0]);
-    x += 5;
+    x += GUTTER;
     drawSparkbox(x, y, STATE.keyvals[4].key, STATE.keyvals[4].val, STATE.sparks[1]);
-    x += 5;
+    x += GUTTER;
     drawSparkbox(x, y, STATE.keyvals[5].key, STATE.keyvals[5].val, STATE.sparks[2]);
 
     // third row
-    x = 5;
-    y += SPARKBOX_HEIGHT + 5;
+    x = MARGIN;
+    y += SPARKBOX_HEIGHT + GUTTER;
     drawSparkbox(x, y, STATE.keyvals[6].key, STATE.keyvals[6].val, STATE.sparks[3]);
-    x += 5;
+    x += GUTTER;
     drawSparkbox(x, y, STATE.keyvals[7].key, STATE.keyvals[7].val, STATE.sparks[4]);
-    x += 5;
+    x += GUTTER;
     drawSparkbox(x, y, STATE.keyvals[8].key, STATE.keyvals[8].val, STATE.sparks[5]);
 
     // version tag (left) and host message / battery (right)
     std::stringstream tag;
     tag << BLE_NAME << " " << GIT_REVISION << " " << INTERFACE_VERSION;
-    x = 5;
-    y = MF_DISPLAY.height() - 12;
-    drawText(tag.str().c_str(), x, y);
+    x = MARGIN;
+    y = MF_DISPLAY.height() - 14;
+    drawText(tag.str().c_str(), x, y, 1);
 
     // right side: host message (timestamp) when present, otherwise our own
     // battery reading. We only show battery when there's nothing from the
@@ -361,8 +441,9 @@ void drawStatic()
         }
         right = bat.str();
     }
-    x = MF_DISPLAY.width() - (6 * right.length()) - 5;
-    drawText(right.c_str(), x, y);
+    // size 1 = 6 px wide per char.
+    x = MF_DISPLAY.width() - (6 * right.length()) - MARGIN;
+    drawText(right.c_str(), x, y, 1);
 } // }}}
 
 class ServerCallbacks : public NimBLEServerCallbacks
@@ -383,6 +464,9 @@ class ServerCallbacks : public NimBLEServerCallbacks
                 DISP_DEBOUNCE = 100;
             }
             STATE.reset();
+            // Connection state changed; the connecting-screen is a
+            // full-screen image, so mark the whole screen dirty.
+            DIRTY.markFull();
         }
         NimBLEDevice::startAdvertising();
     }
@@ -394,12 +478,16 @@ class StatusLineCallbacks : public NimBLECharacteristicCallbacks
     {
         std::string value = characteristic->getValue();
         auto uuid = characteristic->getUUID();
+        bool changed = false;
         if (uuid == TOPLINE_UUID && STATE.topLine != value) {
             STATE.topLine = value;
+            changed = true;
         } else if (uuid == MIDLINE_UUID && STATE.midLine != value) {
             STATE.midLine = value;
+            changed = true;
         } else if (uuid == BOTLINE_UUID && STATE.botLine != value) {
             STATE.botLine = value;
+            changed = true;
         } else if (uuid != TOPLINE_UUID && uuid != MIDLINE_UUID && uuid != BOTLINE_UUID) {
             Debug.print("Got value (");
             Debug.print(value.c_str());
@@ -407,6 +495,13 @@ class StatusLineCallbacks : public NimBLECharacteristicCallbacks
             Debug.print(uuid.toString().c_str());
             Debug.println("), ignoring.");
             return;
+        }
+        if (changed) {
+            // Status lines span most of the right half of the header.
+            // Conservatively mark a generous rect: x from the logo's
+            // right edge through the right margin, y covering all three
+            // lines of header text.
+            DIRTY.markPartial(130, 12, MF_DISPLAY.width() - MARGIN, 110);
         }
     }
 } STATUS_CALLBACKS; // }}}
@@ -427,6 +522,12 @@ class KeyValCallbacks : public NimBLECharacteristicCallbacks
             memcpy(&msg, value.data(), sizeof(Msg));
             STATE.keyvals[msg.index].key = msg.key;
             STATE.keyvals[msg.index].val = msg.val;
+            // A single keyval changed — could be a single box. If we
+            // knew the prior index/value we could compute a tight rect;
+            // for simplicity we conservatively mark the whole screen
+            // dirty so the partial-refresh fast path doesn't risk
+            // ghosting from overlapping rectangles after several updates.
+            DIRTY.markFull();
         } else {
             Debug.print("got bad keyval write, size: ");
             Debug.println(value.length());
@@ -465,6 +566,10 @@ class VectorCallbacks : public NimBLECharacteristicCallbacks
                 STATE.sparks[msg.index].points.emplace_back(msg.values[i] / 255.0,
                                                             msg.values[i + 1] / 255.0);
             }
+            // New vector data is a structural change to the sparkline
+            // graph; mark the whole screen dirty to avoid ghosting where
+            // the old graph lines cross the new ones.
+            DIRTY.markFull();
         } else {
             Debug.print("got bad vectors write, size: ");
             Debug.println(value.length());
@@ -477,6 +582,17 @@ class FlushCallbacks : public NimBLECharacteristicCallbacks
     void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &conn) override
     {
         STATE.hostMsg = characteristic->getValue();
+        // The host message goes into the bottom-right corner (same slot
+        // as the battery readout). We only know the new value's *length*
+        // here, not its pixel width, so conservatively mark a generous
+        // strip from where the hostMsg text starts through the right
+        // margin, plus enough height for size-1 text + padding.
+        int16_t msgPxW = (int16_t)(6 * STATE.hostMsg.length());
+        int16_t rightX = (int16_t)MF_DISPLAY.width() - msgPxW - MARGIN;
+        if (rightX < 130) rightX = 130; // don't extend into the BLE_NAME tag
+        DIRTY.markPartial(rightX - 8, MF_DISPLAY.height() - 22,
+                          MF_DISPLAY.width() - MARGIN,
+                          MF_DISPLAY.height() - 2);
         DISP_DEBOUNCE = 100;
     }
 } FLUSH_CALLBACKS; // }}}
@@ -530,6 +646,8 @@ void setup()
 
     Debug.println("initializing display");
     STATE.reset();
+    DIRTY.clear();        // first paint is always full
+    DIRTY.markFull();
     // init(serial_diag_bitrate, initial, reset_duration_ms, pulldown_rst_mode)
     MF_DISPLAY.init(115200, true, 2, false);
     MF_DISPLAY.setFullWindow();
@@ -537,6 +655,7 @@ void setup()
     drawStatic();
     MF_DISPLAY.display();
     MF_DISPLAY.hibernate();
+    DIRTY.clear();
     DISP_DEBOUNCE = 10;
 
     Debug.println("starting ble advert");
@@ -590,8 +709,14 @@ void loop()
         if (was_present != STATE.batteryPresent ||
             (STATE.batteryPresent && abs(was_mv - STATE.batteryMv) >= 50)) {
             // >=50 mV change is worth redrawing for. Smaller ripples are
-            // just ADC noise.
-            DISP_DEBOUNCE = 100;
+            // just ADC noise. The battery text sits in the bottom-right
+            // corner; mark a tight rect there for fast partial refresh.
+            int16_t msgPxW = (int16_t)(6 * 18); // "BAT 4.XXV +" worst case
+            int16_t rightX = (int16_t)MF_DISPLAY.width() - msgPxW - MARGIN;
+            if (rightX < 130) rightX = 130;
+            DIRTY.markPartial(rightX - 8, MF_DISPLAY.height() - 22,
+                              MF_DISPLAY.width() - MARGIN,
+                              MF_DISPLAY.height() - 2);
         }
         BAT_POLL = BAT_INTERVAL_MS;
     } else {
@@ -618,15 +743,39 @@ void loop()
     if (DISP_DEBOUNCE > 0 && DISP_DEBOUNCE > delta) {
         DISP_DEBOUNCE -= delta;
     } else if (DISP_DEBOUNCE > 0) {
-        Debug.println("drawing to display");
+        Debug.print("drawing to display, mode=");
+        Debug.println(DIRTY.full ? "FULL" : "PARTIAL");
         DISP_DEBOUNCE = 0;
         // init() must be called again after hibernate() to wake the panel
         MF_DISPLAY.init(115200, false, 2, false);
-        MF_DISPLAY.setFullWindow();
-        MF_DISPLAY.fillScreen(BG_COLOR);
-        drawStatic();
-        MF_DISPLAY.display();
+
+        if (DIRTY.full) {
+            // Full refresh path. Repaint everything in the buffer, push
+            // it to the panel, then clear the dirty state.
+            MF_DISPLAY.setFullWindow();
+            MF_DISPLAY.fillScreen(BG_COLOR);
+            drawStatic();
+            MF_DISPLAY.display();
+        } else {
+            // Partial refresh path. The buffer is repainted in full so
+            // its contents under the dirty rect are correct, but only
+            // the dirty slice is pushed to the panel for the ~450 ms
+            // fast partial refresh instead of the ~1.2 s fast full one.
+            int16_t w = (int16_t)(DIRTY.x1 - DIRTY.x0 + 1);
+            int16_t h = (int16_t)(DIRTY.y1 - DIRTY.y0 + 1);
+            int16_t xRounded = DIRTY.x0 & ~0x07;                   // round down to 8
+            int16_t wRounded = (int16_t)(((w + (DIRTY.x0 - xRounded) + 7) & ~0x07)); // round up
+            // Repaint the whole buffer (GxEPD2 needs the in-RAM pixels
+            // under the dirty rect to be correct, since it pushes that
+            // slice directly out of the buffer).
+            MF_DISPLAY.setFullWindow();
+            MF_DISPLAY.fillScreen(BG_COLOR);
+            drawStatic();
+            MF_DISPLAY.setPartialWindow(xRounded, DIRTY.y0, wRounded, h);
+            MF_DISPLAY.displayWindow(xRounded, DIRTY.y0, wRounded, h);
+        }
         MF_DISPLAY.hibernate();
+        DIRTY.clear();
         Debug.println("drew to display");
     }
 
