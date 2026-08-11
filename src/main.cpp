@@ -8,6 +8,7 @@
 #include <esp_sleep.h>
 
 #include "bazzite_logo.h"
+#include "sleep_screen.h"
 
 #define SERVICE_UUID                                                                               \
     NimBLEUUID { "95c7b479-8e84-4ce7-a121-faf74bf48c84" }
@@ -34,7 +35,7 @@
 #define SPARKBOX_WIDTH  209
 
 #define INTERFACE_VERSION "IFv01"
-#define GIT_REVISION "NICNIC 0.0.1"
+#define GIT_REVISION "NICNIC 0.0.2"
 
 NimBLEServer *BLE_SERVER = nullptr;
 std::string BLE_NAME = "INKTF";
@@ -44,6 +45,21 @@ std::string BLE_NAME = "INKTF";
 bool INVERTED = false;
 #define FG_COLOR (INVERTED ? GxEPD_WHITE : GxEPD_BLACK)
 #define BG_COLOR (INVERTED ? GxEPD_BLACK : GxEPD_WHITE)
+
+// 5 minutes disconnected enters enter idle mode
+static constexpr unsigned long IDLE_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+
+// separate BLE advertising profiles
+// NimBLE intervals are in 0.625 ms units
+// active: 100-200 ms, idle: 1000-2000 ms
+static constexpr uint16_t ADV_ACTIVE_MIN = 160;
+static constexpr uint16_t ADV_ACTIVE_MAX = 320;
+static constexpr uint16_t ADV_IDLE_MIN   = 1600;
+static constexpr uint16_t ADV_IDLE_MAX   = 3200;
+
+// track idle state and disconnect timing
+static bool IDLE_MODE = false;
+static unsigned long LAST_DISCONNECT_MS = 0;
 
 // Waveshare 5.83" 648x480, SSD1677 controller
 // Full HEIGHT buffer is safe on ESP32-S3 Plus with 8MB PSRAM (~48KB for 1bpp)
@@ -292,6 +308,70 @@ void drawStatic()
     drawText(STATE.hostMsg.c_str(), x, y);
 } // }}}
 
+// helper to switch advertising speed
+// keeps device discoverable while saving power
+void setAdvertisingProfile(bool idle)
+{ // {{{
+    BLEAdvertising *advert = NimBLEDevice::getAdvertising();
+    bool wasAdvertising = advert->isAdvertising();
+
+    if (wasAdvertising) {
+        NimBLEDevice::stopAdvertising();
+    }
+
+    if (idle) {
+        advert->setMinInterval(ADV_IDLE_MIN);
+        advert->setMaxInterval(ADV_IDLE_MAX);
+    } else {
+        advert->setMinInterval(ADV_ACTIVE_MIN);
+        advert->setMaxInterval(ADV_ACTIVE_MAX);
+    }
+
+    NimBLEDevice::startAdvertising();
+} // }}}
+
+// draw the dedicated idle bitmap once, then hibernate the panel
+void drawSleepScreen()
+{ // {{{
+    MF_DISPLAY.init(115200, false, 2, false);
+    MF_DISPLAY.setFullWindow();
+    MF_DISPLAY.fillScreen(BG_COLOR);
+
+    const int16_t bmpW = 640;
+    const int16_t bmpH = 480;
+    const int16_t x = (MF_DISPLAY.width() - bmpW) / 2;
+    const int16_t y = 0;
+
+    MF_DISPLAY.drawBitmap(x, y, sleep_screen_bitmap, bmpW, bmpH, FG_COLOR);
+    MF_DISPLAY.display();
+    MF_DISPLAY.hibernate();
+} // }}}
+
+void enterIdleMode()
+{ // {{{
+    if (IDLE_MODE) {
+        return;
+    }
+
+    Debug.println("entering idle mode");
+    IDLE_MODE = true;
+    DISP_DEBOUNCE = 0; // normal dashboard redraw no longer needed in idle
+    setAdvertisingProfile(true);
+    drawSleepScreen();
+} // }}}
+
+void exitIdleMode()
+{ // {{{
+    if (!IDLE_MODE) {
+        return;
+    }
+
+    Debug.println("leaving idle mode");
+    IDLE_MODE = false;
+    setAdvertisingProfile(false);
+    DISP_DEBOUNCE = 10; // redraw normal dashboard soon
+} // }}}
+
 class ServerCallbacks : public NimBLEServerCallbacks
 { // {{{
     void onConnect(NimBLEServer *server, NimBLEConnInfo &conn) override
@@ -299,6 +379,9 @@ class ServerCallbacks : public NimBLEServerCallbacks
         Debug.println("got connection");
         NimBLEDevice::stopAdvertising();
         STATE.connected = true;
+
+        // any connection exits idle immediately and restores the normal dashboard.
+        exitIdleMode();
     }
 
     void onDisconnect(NimBLEServer *server, NimBLEConnInfo &conn, int reason) override
@@ -310,6 +393,9 @@ class ServerCallbacks : public NimBLEServerCallbacks
                 DISP_DEBOUNCE = 100;
             }
             STATE.reset();
+
+            // start the idle timeout when the device becomes disconnected.
+            LAST_DISCONNECT_MS = millis();
         }
         NimBLEDevice::startAdvertising();
     }
@@ -404,6 +490,10 @@ class FlushCallbacks : public NimBLECharacteristicCallbacks
     void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &conn) override
     {
         STATE.hostMsg = characteristic->getValue();
+
+        // any incoming data implies active use, so leave idle mode and redraw dashboard
+        exitIdleMode();
+
         DISP_DEBOUNCE = 100;
     }
 } FLUSH_CALLBACKS; // }}}
@@ -450,7 +540,6 @@ void setup()
 
     Debug.println("initializing display");
     STATE.reset();
-    // init(serial_diag_bitrate, initial, reset_duration_ms, pulldown_rst_mode)
     MF_DISPLAY.init(115200, true, 2, false);
     MF_DISPLAY.setFullWindow();
     MF_DISPLAY.fillScreen(BG_COLOR);
@@ -472,7 +561,12 @@ void setup()
     advert->setAdvertisementData(ad_data);
     advert->addServiceUUID(SERVICE_UUID);
     advert->enableScanResponse(false);
-    NimBLEDevice::startAdvertising();
+
+    // start in normal/active advertising profile.
+    setAdvertisingProfile(false);
+
+    // device starts disconnected, so begin idle timeout from boot.
+    LAST_DISCONNECT_MS = millis();
 
 } // }}}
 
@@ -503,18 +597,35 @@ void loop()
         CONN_DEBOUNCE = 5000;
     }
 
+    // after 5 minutes with no BLE connection, enter idle mode.
+    if (!IDLE_MODE && BLE_SERVER->getConnectedCount() == 0) {
+        unsigned long disconnectedFor = now - LAST_DISCONNECT_MS;
+        if (now < LAST_DISCONNECT_MS) {
+            disconnectedFor = (std::numeric_limits<unsigned long>::max() - LAST_DISCONNECT_MS) + now;
+        }
+
+        if (disconnectedFor >= IDLE_TIMEOUT_MS) {
+            enterIdleMode();
+        }
+    }
+
     if (DISP_DEBOUNCE > 0 && DISP_DEBOUNCE > delta) {
         DISP_DEBOUNCE -= delta;
     } else if (DISP_DEBOUNCE > 0) {
         Debug.println("drawing to display");
         DISP_DEBOUNCE = 0;
-        // init() must be called again after hibernate() to wake the panel
-        MF_DISPLAY.init(115200, false, 2, false);
-        MF_DISPLAY.setFullWindow();
-        MF_DISPLAY.fillScreen(BG_COLOR);
-        drawStatic();
-        MF_DISPLAY.display();
-        MF_DISPLAY.hibernate();
+
+        // if idle mode is active, keep the dedicated sleep bitmap instead of redrawing dashboard
+        if (!IDLE_MODE) {
+            // init() must be called again after hibernate() to wake the panel
+            MF_DISPLAY.init(115200, false, 2, false);
+            MF_DISPLAY.setFullWindow();
+            MF_DISPLAY.fillScreen(BG_COLOR);
+            drawStatic();
+            MF_DISPLAY.display();
+            MF_DISPLAY.hibernate();
+        }
+
         Debug.println("drew to display");
     }
 

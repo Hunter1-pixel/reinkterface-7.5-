@@ -1,5 +1,5 @@
 # reinkterface
-Fork of [Valve's Inkterface](https://gitlab.steamos.cloud/SteamHardware/SteamMachine/inkterface/) for non Steam Machine usage with simpler hardware
+Fork of [Valve's Inkterface](https://gitlab.steamos.cloud/SteamHardware/SteamMachine/inkterface/) for non Steam Machine usage with simpler hardware and additional features.
 
 ![](./docs/reinkterface.jpg)
 
@@ -15,6 +15,13 @@ Changes to the code:
 - Completely removed battery logic as the board will be wired to the motherboard's USB port internally.
 - Increased height of the stat tiles from 100 to 150px.
 - Swapped the logo in the top left corner to Bazzite.
+- Added idle mode and sleep screen:
+    - Board draws [TRMNL's sleep screen](https://help.trmnl.com/en/articles/11129379-sleep-mode) after 5 minutes of not being connected over Bluetooth.
+    - Bluetooth advertising remains enabled while idle so the device stays discoverable.
+    - Advertising interval is reduced in idle mode to lower power usage.
+    - Normal dashboard mode is restored automatically when Valve's Interface reconnects and sends fresh data.
+
+![](./docs/reinkterface_sleep_screen.jpg)
 
 ## Hardware needed
 - Board - [XIAO ePaper Display Board(ESP32-S3) - EE04](https://www.seeedstudio.com/XIAO-ePaper-Display-Board-EE04-p-6560.html)
