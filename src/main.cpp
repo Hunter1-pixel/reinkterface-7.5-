@@ -8,6 +8,7 @@
 #include <esp_sleep.h>
 
 #include "bazzite_logo.h"
+#include "sleep_screen.h"
 
 #define SERVICE_UUID                                                                               \
     NimBLEUUID { "95c7b479-8e84-4ce7-a121-faf74bf48c84" }
@@ -77,6 +78,10 @@
 NimBLEServer *BLE_SERVER = nullptr;
 std::string BLE_NAME = "INKTF";
 
+// Debug logging goes to the USB serial port. Aliased so we can swap it out
+// (e.g. to a disabled no-op) in one place if we ever want a quiet build.
+#define Debug Serial
+
 // Dirty-region tracker.
 //
 // The host BLE frame (status lines / keyvals / vectors / flush) redraws
@@ -131,6 +136,26 @@ struct DirtyRegion {
 bool INVERTED = false;
 #define FG_COLOR (INVERTED ? GxEPD_WHITE : GxEPD_BLACK)
 #define BG_COLOR (INVERTED ? GxEPD_BLACK : GxEPD_WHITE)
+
+// Idle / sleep screen behavior, merged from upstream.
+// After 5 minutes without a BLE connection the board switches to a low-power
+// idle mode: it draws TRMNL's sleep bitmap once, then hibernates the panel.
+// Bluetooth advertising stays enabled so the device remains discoverable, but
+// the advertising interval is widened to lower power usage. Any connection or
+// host-side BLE write exits idle and forces a fresh dashboard redraw.
+static constexpr unsigned long IDLE_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+
+// NimBLE advertising intervals are specified in 0.625 ms units.
+//   active: 100-200 ms (responsive when the user just walked up to the case)
+//   idle:   1000-2000 ms (still discoverable, but ~10x less radio time)
+static constexpr uint16_t ADV_ACTIVE_MIN = 160;
+static constexpr uint16_t ADV_ACTIVE_MAX = 320;
+static constexpr uint16_t ADV_IDLE_MIN   = 1600;
+static constexpr uint16_t ADV_IDLE_MAX   = 3200;
+
+// track idle state and disconnect timing
+static bool IDLE_MODE = false;
+static unsigned long LAST_DISCONNECT_MS = 0;
 
 // TRMNL 7.5" OG DIY Kit uses the Good Display GDEY075T7 (800x480,
 // UC8179 / GD7965 controller). The XIAO ESP32-S3 Plus has 8MB OPI
@@ -446,6 +471,70 @@ void drawStatic()
     drawText(right.c_str(), x, y, 1);
 } // }}}
 
+// helper to switch advertising speed
+// keeps device discoverable while saving power
+void setAdvertisingProfile(bool idle)
+{ // {{{
+    BLEAdvertising *advert = NimBLEDevice::getAdvertising();
+    bool wasAdvertising = advert->isAdvertising();
+
+    if (wasAdvertising) {
+        NimBLEDevice::stopAdvertising();
+    }
+
+    if (idle) {
+        advert->setMinInterval(ADV_IDLE_MIN);
+        advert->setMaxInterval(ADV_IDLE_MAX);
+    } else {
+        advert->setMinInterval(ADV_ACTIVE_MIN);
+        advert->setMaxInterval(ADV_ACTIVE_MAX);
+    }
+
+    NimBLEDevice::startAdvertising();
+} // }}}
+
+// draw the dedicated idle bitmap once, then hibernate the panel
+void drawSleepScreen()
+{ // {{{
+    MF_DISPLAY.init(115200, false, 2, false);
+    MF_DISPLAY.setFullWindow();
+    MF_DISPLAY.fillScreen(BG_COLOR);
+
+    const int16_t bmpW = 640;
+    const int16_t bmpH = 480;
+    const int16_t x = (MF_DISPLAY.width() - bmpW) / 2;
+    const int16_t y = 0;
+
+    MF_DISPLAY.drawBitmap(x, y, sleep_screen_bitmap, bmpW, bmpH, FG_COLOR);
+    MF_DISPLAY.display();
+    MF_DISPLAY.hibernate();
+} // }}}
+
+void enterIdleMode()
+{ // {{{
+    if (IDLE_MODE) {
+        return;
+    }
+
+    Debug.println("entering idle mode");
+    IDLE_MODE = true;
+    DISP_DEBOUNCE = 0; // normal dashboard redraw no longer needed in idle
+    setAdvertisingProfile(true);
+    drawSleepScreen();
+} // }}}
+
+void exitIdleMode()
+{ // {{{
+    if (!IDLE_MODE) {
+        return;
+    }
+
+    Debug.println("leaving idle mode");
+    IDLE_MODE = false;
+    setAdvertisingProfile(false);
+    DISP_DEBOUNCE = 10; // redraw normal dashboard soon
+} // }}}
+
 class ServerCallbacks : public NimBLEServerCallbacks
 { // {{{
     void onConnect(NimBLEServer *server, NimBLEConnInfo &conn) override
@@ -453,6 +542,9 @@ class ServerCallbacks : public NimBLEServerCallbacks
         Debug.println("got connection");
         NimBLEDevice::stopAdvertising();
         STATE.connected = true;
+
+        // any connection exits idle immediately and restores the normal dashboard.
+        exitIdleMode();
     }
 
     void onDisconnect(NimBLEServer *server, NimBLEConnInfo &conn, int reason) override
@@ -467,6 +559,9 @@ class ServerCallbacks : public NimBLEServerCallbacks
             // Connection state changed; the connecting-screen is a
             // full-screen image, so mark the whole screen dirty.
             DIRTY.markFull();
+
+            // start the idle timeout when the device becomes disconnected.
+            LAST_DISCONNECT_MS = millis();
         }
         NimBLEDevice::startAdvertising();
     }
@@ -593,6 +688,11 @@ class FlushCallbacks : public NimBLECharacteristicCallbacks
         DIRTY.markPartial(rightX - 8, MF_DISPLAY.height() - 22,
                           MF_DISPLAY.width() - MARGIN,
                           MF_DISPLAY.height() - 2);
+
+        // any incoming data implies active use, so leave idle mode and
+        // redraw the dashboard instead of staying on the sleep screen.
+        exitIdleMode();
+
         DISP_DEBOUNCE = 100;
     }
 } FLUSH_CALLBACKS; // }}}
@@ -671,7 +771,12 @@ void setup()
     advert->setAdvertisementData(ad_data);
     advert->addServiceUUID(SERVICE_UUID);
     advert->enableScanResponse(false);
-    NimBLEDevice::startAdvertising();
+
+    // start in normal/active advertising profile.
+    setAdvertisingProfile(false);
+
+    // device starts disconnected, so begin idle timeout from boot.
+    LAST_DISCONNECT_MS = millis();
 
 } // }}}
 
@@ -740,41 +845,61 @@ void loop()
         CONN_DEBOUNCE = 5000;
     }
 
+    // after 5 minutes with no BLE connection, enter idle mode.
+    if (!IDLE_MODE && BLE_SERVER->getConnectedCount() == 0) {
+        unsigned long disconnectedFor = now - LAST_DISCONNECT_MS;
+        if (now < LAST_DISCONNECT_MS) {
+            disconnectedFor = (std::numeric_limits<unsigned long>::max() - LAST_DISCONNECT_MS) + now;
+        }
+
+        if (disconnectedFor >= IDLE_TIMEOUT_MS) {
+            enterIdleMode();
+        }
+    }
+
     if (DISP_DEBOUNCE > 0 && DISP_DEBOUNCE > delta) {
         DISP_DEBOUNCE -= delta;
     } else if (DISP_DEBOUNCE > 0) {
         Debug.print("drawing to display, mode=");
         Debug.println(DIRTY.full ? "FULL" : "PARTIAL");
         DISP_DEBOUNCE = 0;
-        // init() must be called again after hibernate() to wake the panel
-        MF_DISPLAY.init(115200, false, 2, false);
 
-        if (DIRTY.full) {
-            // Full refresh path. Repaint everything in the buffer, push
-            // it to the panel, then clear the dirty state.
-            MF_DISPLAY.setFullWindow();
-            MF_DISPLAY.fillScreen(BG_COLOR);
-            drawStatic();
-            MF_DISPLAY.display();
-        } else {
-            // Partial refresh path. The buffer is repainted in full so
-            // its contents under the dirty rect are correct, but only
-            // the dirty slice is pushed to the panel for the ~450 ms
-            // fast partial refresh instead of the ~1.2 s fast full one.
-            int16_t w = (int16_t)(DIRTY.x1 - DIRTY.x0 + 1);
-            int16_t h = (int16_t)(DIRTY.y1 - DIRTY.y0 + 1);
-            int16_t xRounded = DIRTY.x0 & ~0x07;                   // round down to 8
-            int16_t wRounded = (int16_t)(((w + (DIRTY.x0 - xRounded) + 7) & ~0x07)); // round up
-            // Repaint the whole buffer (GxEPD2 needs the in-RAM pixels
-            // under the dirty rect to be correct, since it pushes that
-            // slice directly out of the buffer).
-            MF_DISPLAY.setFullWindow();
-            MF_DISPLAY.fillScreen(BG_COLOR);
-            drawStatic();
-            MF_DISPLAY.setPartialWindow(xRounded, DIRTY.y0, wRounded, h);
-            MF_DISPLAY.displayWindow(xRounded, DIRTY.y0, wRounded, h);
+        // while idle, the sleep screen is the source of truth; skip the
+        // dashboard redraw entirely (and clear the dirty state so any
+        // battery-only change doesn't keep accumulating). exitIdleMode()
+        // sets DISP_DEBOUNCE = 10, which forces the next iteration to
+        // repaint the dashboard.
+        if (!IDLE_MODE) {
+            // init() must be called again after hibernate() to wake the panel
+            MF_DISPLAY.init(115200, false, 2, false);
+
+            if (DIRTY.full) {
+                // Full refresh path. Repaint everything in the buffer, push
+                // it to the panel, then clear the dirty state.
+                MF_DISPLAY.setFullWindow();
+                MF_DISPLAY.fillScreen(BG_COLOR);
+                drawStatic();
+                MF_DISPLAY.display();
+            } else {
+                // Partial refresh path. The buffer is repainted in full so
+                // its contents under the dirty rect are correct, but only
+                // the dirty slice is pushed to the panel for the ~450 ms
+                // fast partial refresh instead of the ~1.2 s fast full one.
+                int16_t w = (int16_t)(DIRTY.x1 - DIRTY.x0 + 1);
+                int16_t h = (int16_t)(DIRTY.y1 - DIRTY.y0 + 1);
+                int16_t xRounded = DIRTY.x0 & ~0x07;                   // round down to 8
+                int16_t wRounded = (int16_t)(((w + (DIRTY.x0 - xRounded) + 7) & ~0x07)); // round up
+                // Repaint the whole buffer (GxEPD2 needs the in-RAM pixels
+                // under the dirty rect to be correct, since it pushes that
+                // slice directly out of the buffer).
+                MF_DISPLAY.setFullWindow();
+                MF_DISPLAY.fillScreen(BG_COLOR);
+                drawStatic();
+                MF_DISPLAY.setPartialWindow(xRounded, DIRTY.y0, wRounded, h);
+                MF_DISPLAY.displayWindow(xRounded, DIRTY.y0, wRounded, h);
+            }
+            MF_DISPLAY.hibernate();
         }
-        MF_DISPLAY.hibernate();
         DIRTY.clear();
         Debug.println("drew to display");
     }

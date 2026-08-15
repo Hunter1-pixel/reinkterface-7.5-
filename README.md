@@ -1,6 +1,5 @@
 # reinkterface
-
-Fork of [Valve's Inkterface](https://gitlab.steamos.cloud/SteamHardware/SteamMachine/inkterface/) for non Steam Machine usage with simpler hardware — now targeting the **TRMNL 7.5" (OG) DIY Kit**.
+Fork of [Valve's Inkterface](https://gitlab.steamos.cloud/SteamHardware/SteamMachine/inkterface/) for non Steam Machine usage with simpler hardware and additional features — now targeting the **TRMNL 7.5" (OG) DIY Kit**.
 
 ![](./docs/reinkterface.jpg)
 
@@ -19,6 +18,13 @@ Changes to the code (vs. the upstream Waveshare 5.83" build):
 - **Partial refresh:** the GDEY075T7 supports fast partial update (`~450 ms` vs `~1.2 s` for fast full), so we track a dirty region per BLE flush. A new host frame marks the whole screen dirty and we do a fast full refresh; a battery-only change (the 5 s ADC poll) marks just the bottom-right corner strip and we do a fast partial refresh of that rect instead of flickering the whole panel.
 - **Battery logic restored:** the original 5.83" fork removed battery handling because that board was hard-wired to a motherboard's USB header. The TRMNL kit includes a JST-connected 2000 mAh Li-ion cell with a divider on GPIO1 and a load-switch enable on GPIO6. We sample that every 5 s and render `BAT <X.XX>V` in the bottom-right corner when the host message slot is empty.
 - **Swapped the logo in the top-left corner** to Bazzite (unchanged from the 5.83" build — it's still 100×100 px and that lands in the same spot).
+- **Added idle mode and sleep screen** (merged from upstream):
+    - Board draws [TRMNL's sleep screen](https://help.trmnl.com/en/articles/11129379-sleep-mode) after 5 minutes of not being connected over Bluetooth. The 640×480 bitmap is centered on the 800×480 panel.
+    - Bluetooth advertising remains enabled while idle so the device stays discoverable.
+    - Advertising interval is reduced in idle mode (100–200 ms → 1000–2000 ms) to lower power usage.
+    - Normal dashboard mode is restored automatically when Valve's Interface reconnects and sends fresh data; a full refresh is forced when the host flushes new data so the sleep image doesn't ghost.
+
+![](./docs/reinkterface_sleep_screen.jpg)
 
 ## Hardware needed
 - Board, e-ink panel and battery - https://www.seeedstudio.com/TRMNL-7-5-Inch-OG-DIY-Kit-p-6481.html
