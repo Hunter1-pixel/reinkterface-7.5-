@@ -246,7 +246,12 @@ struct State { // {{{
 
         connected = false;
         topLine = "Waiting on connection...";
-        midLine = BLE_NAME;
+        // midLine is now the host-controlled Steam display name slot.
+        // The firmware renders the BLE device name directly from
+        // BLE_NAME in drawStatic(), so we don't put BLE_NAME here
+        // anymore — if we did, the very first BLE write from the
+        // host would clobber it anyway.
+        midLine = "";
         botLine = "";
         hostMsg = "";
         keyvals[0].key = "OS";
@@ -386,11 +391,17 @@ void drawDiscreteBox(int16_t &x, const int16_t &y, const std::string &title,
     if (!title.empty()) {
         MF_DISPLAY.drawRoundRect(x, y, w, h, 4, FG_COLOR);
         MF_DISPLAY.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 4, FG_COLOR);
-        // Size 3 text needs more vertical padding to stay optically centered
-        // in the 36 px box height.
+        // Title at size 3 (18 px/char) on the left; value at size 2
+        // (12 px/char) on the right. The value was previously size 3,
+        // which collided with the title when the value was long — the
+        // worst offender was the STEAM box, whose value is the Steam
+        // client build ID (10 digits, ~180 px wide at size 3 in a 260
+        // px-wide box, well past the title's right edge). size 2 keeps
+        // even a 10-digit value at ~120 px so there is always a visible
+        // gap between the title and the value.
         drawText(title.c_str(), x + hpad, y + vpad, 3);
         drawText(value.c_str(),
-                 (x + (w - hpad)) - (18 * strlen(value.c_str())), y + vpad, 3);
+                 (x + (w - hpad)) - (12 * strlen(value.c_str())), y + vpad, 2);
     }
 
     x += w;
@@ -406,17 +417,29 @@ void drawStatic()
     y = MARGIN;
     drawLogo(x, y);
 
-    // show connected fremont hostname/serial or connecting status
-    // Sized for the bigger 7.5" canvas:
-    //   - topline: size 4 (24 px tall) — the headline
-    //   - midline: size 3 (18 px tall) — secondary info
-    //   - botline: size 3 (18 px tall) — tertiary info
+    // Header (right of logo, x = 130):
+    //   line 1: STATE.topLine  — size 4, host-controlled headline
+    //           (typically the hostname, e.g. "bazzite")
+    //   line 2: BLE_NAME       — size 3, firmware-controlled device name
+    //           (e.g. "INKTF-A1B2C3"); rendered directly from BLE_NAME
+    //           so it stays visible even when the host pushes its own
+    //           value to STATE.midLine via MIDLINE_UUID.
+    //   line 3: STATE.midLine  — size 3, host-controlled; intended slot
+    //           for the user's Steam display name (sent by Valve's
+    //           Inkterface host app to MIDLINE_UUID).
+    //   line 4: STATE.botLine  — size 3, host-controlled tertiary info
+    //           (typically current activity like "Gaming").
+    //
+    // Vertical budget: 4 lines × 22 px spacing + 6 px top margin = 94 px,
+    // well within the 120 px gap before the first row of boxes.
     x = 130;
-    y = 18;
+    y = 12;
     drawText(STATE.topLine.c_str(), x, y, 4);
-    y += 32;
+    y += 24;
+    drawText(BLE_NAME.c_str(), x, y, 3);
+    y += 22;
     drawText(STATE.midLine.c_str(), x, y, 3);
-    y += 28;
+    y += 22;
     drawText(STATE.botLine.c_str(), x, y, 3);
 
     // first row of boxes with no sparklines
@@ -594,9 +617,18 @@ class StatusLineCallbacks : public NimBLECharacteristicCallbacks
         if (changed) {
             // Status lines span most of the right half of the header.
             // Conservatively mark a generous rect: x from the logo's
-            // right edge through the right margin, y covering all three
-            // lines of header text.
-            DIRTY.markPartial(130, 12, MF_DISPLAY.width() - MARGIN, 110);
+            // right edge through the right margin, y covering all four
+            // lines of header text (topLine at y=12, BLE_NAME at y=36,
+            // midLine at y=58, botLine at y=80 — use y=104 to be safe).
+            DIRTY.markPartial(130, 8, MF_DISPLAY.width() - MARGIN, 104);
+
+            // A bare status-line write still has to redraw — the host
+            // may push these between flushes (e.g. a transient CPU temp
+            // spike), and without bumping the debounce timer the dirty
+            // rect would otherwise sit until the next flush. Treat it
+            // like a flush for scheduling + idle-exit purposes.
+            exitIdleMode();
+            DISP_DEBOUNCE = 100;
         }
     }
 } STATUS_CALLBACKS; // }}}
@@ -881,21 +913,22 @@ void loop()
                 drawStatic();
                 MF_DISPLAY.display();
             } else {
-                // Partial refresh path. The buffer is repainted in full so
-                // its contents under the dirty rect are correct, but only
-                // the dirty slice is pushed to the panel for the ~450 ms
-                // fast partial refresh instead of the ~1.2 s fast full one.
+                // Partial refresh path. We use setPartialWindow() to
+                // *clip drawPixel()* to the dirty rect, then re-run
+                // drawStatic(). Every pixel that falls outside the dirty
+                // rect is silently dropped by drawPixel(), so the
+                // buffer is only updated inside the rect — and the
+                // untouched parts of the buffer remain in sync with the
+                // panel from the previous refresh. We deliberately do
+                // NOT call fillScreen() here (it ignores the partial
+                // window and would wipe the whole 48 KB buffer for
+                // nothing).
                 int16_t w = (int16_t)(DIRTY.x1 - DIRTY.x0 + 1);
                 int16_t h = (int16_t)(DIRTY.y1 - DIRTY.y0 + 1);
                 int16_t xRounded = DIRTY.x0 & ~0x07;                   // round down to 8
                 int16_t wRounded = (int16_t)(((w + (DIRTY.x0 - xRounded) + 7) & ~0x07)); // round up
-                // Repaint the whole buffer (GxEPD2 needs the in-RAM pixels
-                // under the dirty rect to be correct, since it pushes that
-                // slice directly out of the buffer).
-                MF_DISPLAY.setFullWindow();
-                MF_DISPLAY.fillScreen(BG_COLOR);
-                drawStatic();
                 MF_DISPLAY.setPartialWindow(xRounded, DIRTY.y0, wRounded, h);
+                drawStatic();
                 MF_DISPLAY.displayWindow(xRounded, DIRTY.y0, wRounded, h);
             }
             MF_DISPLAY.hibernate();

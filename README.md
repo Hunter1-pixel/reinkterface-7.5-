@@ -98,3 +98,4 @@ This matches the official pin definitions used by `usetrmnl/trmnl-firmware` for 
 
 ## Disclaimer
 I have used LLM to speed up the process of rewriting the code and adjusted it afterwards.
+Also Credits to nicnic-cc for originally creating the reinkterface project
