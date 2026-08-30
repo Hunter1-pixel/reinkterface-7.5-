@@ -8,7 +8,7 @@
 #include <esp_sleep.h>
 
 #include "bazzite_logo.h"
-#include "sleep_screen.h"
+#include "gaben_sleep_screen.h"
 
 #define SERVICE_UUID                                                                               \
     NimBLEUUID { "95c7b479-8e84-4ce7-a121-faf74bf48c84" }
@@ -46,23 +46,7 @@
 #define PIN_BAT_ADC  1
 #define PIN_BAT_EN   6
 
-// Layout sizing for the 7.5" 800x480 GDEY075T7 panel.
-// The 5.83" build used 209x100 sparkboxes with size-2 (12 px) text. On the
-// wider, larger 7.5" panel that's undersized for desk-distance viewing, so
-// we scaled up proportionally:
-//   - sparkbox width  209 -> 260 px  (matches 800 / 3 columns + gutters)
-//   - sparkbox height 100 -> 150 px  (1.5x, gives graphs room under title)
-//   - discrete box    26  -> 36 px   (taller to host size-3 text)
-//   - title font      2   -> 3       (12 px -> 18 px)
-//   - top-line font   3   -> 4       (18 px -> 24 px)
-//   - gutter          5   -> 5 px    (kept; panel is wider so absolute
-//                                   gutter already feels roomier)
-//
-// Vertical budget for box rows: 480 - 120 (header) - 14 (bottom margin) = 346 px
-//   discrete(36) + gutter(5) + spark(150) + gutter(5) + spark(150) = 346 px ✓
-//
-// Width math (must tile edge-to-edge):
-//   MARGIN(5) + 260 + GUTTER(5) + 260 + GUTTER(5) + 260 + MARGIN(5) = 800 ✓
+// 800x480 panel layout.
 #define SPARKBOX_HEIGHT     150
 #define SPARKBOX_WIDTH      260
 #define DISCRETEBOX_WIDTH   260
@@ -71,6 +55,13 @@
 #define MARGIN              5
 // Title bar height inside each box; sparkbox graph area = (height - title_h - 32).
 #define SPARKBOX_TITLE_H    32
+#define PANEL_WIDTH         800
+#define PANEL_HEIGHT        480
+#define HEADER_X            130
+#define HEADER_Y            12
+#define BOX_TOP_Y           120
+#define BOX_PAD_X           8
+#define FOOTER_Y_OFFSET     14
 
 #define INTERFACE_VERSION "IFv01"
 #define GIT_REVISION "INKTF 0.1.0"
@@ -139,7 +130,7 @@ bool INVERTED = false;
 
 // Idle / sleep screen behavior, merged from upstream.
 // After 5 minutes without a BLE connection the board switches to a low-power
-// idle mode: it draws TRMNL's sleep bitmap once, then hibernates the panel.
+// idle mode: it draws the Gaben sleep bitmap once, then hibernates the panel.
 // Bluetooth advertising stays enabled so the device remains discoverable, but
 // the advertising interval is widened to lower power usage. Any connection or
 // host-side BLE write exits idle and forces a fresh dashboard redraw.
@@ -152,6 +143,7 @@ static constexpr uint16_t ADV_ACTIVE_MIN = 160;
 static constexpr uint16_t ADV_ACTIVE_MAX = 320;
 static constexpr uint16_t ADV_IDLE_MIN   = 1600;
 static constexpr uint16_t ADV_IDLE_MAX   = 3200;
+static constexpr int16_t FOOTER_RIGHT_X  = 430;
 
 // track idle state and disconnect timing
 static bool IDLE_MODE = false;
@@ -275,6 +267,133 @@ struct State { // {{{
     }
 } STATE; // }}}
 
+void drawText(const char *text, const int16_t &x = -1, const int16_t &y = -1,
+              const uint8_t &size = 1, const bool &wrap = false);
+void exitIdleMode();
+
+static int16_t clampI16(int16_t value, int16_t low, int16_t high)
+{
+    if (value < low) return low;
+    if (value > high) return high;
+    return value;
+}
+
+static int16_t textWidth(const std::string &text, uint8_t size)
+{
+    return (int16_t)(text.length() * 6 * size);
+}
+
+static std::string boundedString(const char *text, size_t maxLen)
+{
+    size_t len = 0;
+    while (len < maxLen && text[len] != '\0') {
+        len++;
+    }
+    return std::string(text, len);
+}
+
+static std::string truncateToWidth(const std::string &text, int16_t maxW, uint8_t size)
+{
+    if (maxW <= 0 || size == 0) {
+        return "";
+    }
+
+    size_t maxChars = (size_t)(maxW / (6 * size));
+    if (text.length() <= maxChars) {
+        return text;
+    }
+    if (maxChars == 0) {
+        return "";
+    }
+    if (maxChars == 1) {
+        return text.substr(0, 1);
+    }
+
+    return text.substr(0, maxChars - 1) + "~";
+}
+
+static uint8_t fitTextSize(const std::string &text, int16_t maxW, uint8_t preferred,
+                           uint8_t minimum)
+{
+    uint8_t size = preferred;
+    while (size > minimum && textWidth(text, size) > maxW) {
+        size--;
+    }
+    return size;
+}
+
+void drawTextFit(const std::string &text, int16_t x, int16_t y, int16_t maxW,
+                 uint8_t preferredSize, uint8_t minimumSize = 1)
+{
+    uint8_t size = fitTextSize(text, maxW, preferredSize, minimumSize);
+    drawText(truncateToWidth(text, maxW, size).c_str(), x, y, size);
+}
+
+void drawTextFitRight(const std::string &text, int16_t rightX, int16_t y, int16_t maxW,
+                      uint8_t preferredSize, uint8_t minimumSize = 1)
+{
+    uint8_t size = fitTextSize(text, maxW, preferredSize, minimumSize);
+    std::string fitted = truncateToWidth(text, maxW, size);
+    drawText(fitted.c_str(), rightX - textWidth(fitted, size), y, size);
+}
+
+static void markDirtyRect(int16_t x0, int16_t y0, int16_t x1, int16_t y1)
+{
+    DIRTY.markPartial(clampI16(x0, 0, PANEL_WIDTH - 1),
+                      clampI16(y0, 0, PANEL_HEIGHT - 1),
+                      clampI16(x1, 0, PANEL_WIDTH - 1),
+                      clampI16(y1, 0, PANEL_HEIGHT - 1));
+}
+
+static void boxRectForIndex(uint8_t index, int16_t &x, int16_t &y, int16_t &w, int16_t &h)
+{
+    uint8_t col = index;
+    y = BOX_TOP_Y;
+    h = DISCRETEBOX_HEIGHT;
+
+    if (index >= 3) {
+        col = (uint8_t)((index - 3) % 3);
+        y = (int16_t)(BOX_TOP_Y + DISCRETEBOX_HEIGHT + GUTTER +
+                      (((index - 3) / 3) * (SPARKBOX_HEIGHT + GUTTER)));
+        h = SPARKBOX_HEIGHT;
+    }
+
+    x = (int16_t)(MARGIN + col * (DISCRETEBOX_WIDTH + GUTTER));
+    w = DISCRETEBOX_WIDTH;
+}
+
+static void markBoxDirty(uint8_t index)
+{
+    if (index >= 9) {
+        DIRTY.markFull();
+        return;
+    }
+
+    int16_t x, y, w, h;
+    boxRectForIndex(index, x, y, w, h);
+    markDirtyRect(x, y, (int16_t)(x + w - 1), (int16_t)(y + h - 1));
+}
+
+static void markFooterDirty()
+{
+    markDirtyRect(FOOTER_RIGHT_X, MF_DISPLAY.height() - 22,
+                  MF_DISPLAY.width() - MARGIN,
+                  MF_DISPLAY.height() - 2);
+}
+
+static void scheduleDashboardRefresh(unsigned long delayMs = 100)
+{
+    exitIdleMode();
+    DISP_DEBOUNCE = delayMs;
+}
+
+static void scheduleActiveRefresh(unsigned long delayMs = 100)
+{
+    if (!IDLE_MODE) {
+        DISP_DEBOUNCE = delayMs;
+    }
+}
+
 // Read the battery divider through the EE04's load switch. Returns the
 // measured cell voltage in millivolts, or -1 if the divider reads as
 // floating (no battery connected, switch stuck off, etc.).
@@ -310,8 +429,8 @@ static int readBatteryMv()
     return (int)(mv + 0.5f);
 }
 
-void drawText(const char *text, const int16_t &x = -1, const int16_t &y = -1,
-              const uint8_t &size = 1, const bool &wrap = false)
+void drawText(const char *text, const int16_t &x, const int16_t &y,
+              const uint8_t &size, const bool &wrap)
 { // {{{
     if (x >= 0 && y >= 0) {
         MF_DISPLAY.setCursor(x, y);
@@ -328,13 +447,24 @@ void drawLogo(int16_t &x, const int16_t &y = 0)
     x += 101;
 } // }}}
 
+static void drawBoxFrame(int16_t x, int16_t y, int16_t w, int16_t h)
+{
+    MF_DISPLAY.drawRoundRect(x, y, w, h, 4, FG_COLOR);
+    MF_DISPLAY.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 4, FG_COLOR);
+}
+
+static void drawBoxTitleValue(int16_t x, int16_t y, int16_t w, const std::string &title,
+                              const std::string &value, uint8_t valueSize)
+{
+    drawTextFit(title, x + BOX_PAD_X, y + 6, 94, 3, 2);
+    drawTextFitRight(value, x + w - BOX_PAD_X, y + 6, w - 118, valueSize, 1);
+}
+
 void drawSparkbox(int16_t &x, const int16_t &y, std::string &title, const std::string &value,
                   const Points &points)
 { // {{{
     const int16_t w = SPARKBOX_WIDTH;
     const int16_t h = SPARKBOX_HEIGHT;
-    const int16_t hpad = 8;
-    const int16_t vpad = 6;
     const int16_t title_h = SPARKBOX_TITLE_H;
     const int16_t graph_h = (h - title_h) - 32;
     const int16_t graph_w = w - 20;
@@ -342,24 +472,19 @@ void drawSparkbox(int16_t &x, const int16_t &y, std::string &title, const std::s
     const int16_t graph_y = (y + h) - 16;
 
     if (!title.empty()) {
-        MF_DISPLAY.drawRoundRect(x, y, w, h, 4, FG_COLOR);
-        MF_DISPLAY.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 4, FG_COLOR);
+        drawBoxFrame(x, y, w, h);
         MF_DISPLAY.fillRect(x, y + title_h, w, 1, FG_COLOR);
-        // Title text bumped to size 3 (18 px) so it reads from desk distance.
-        drawText(title.c_str(), x + hpad, y + vpad, 3);
-        // Value uses size 3; width-per-char for size 3 is ~18 px (vs 12 for size 2).
-        drawText(value.c_str(),
-                 (x + (w - hpad)) - (18 * strlen(value.c_str())), y + vpad, 3);
+        drawBoxTitleValue(x, y, w, title, value, 3);
 
         std::stringstream maxstrm;
         maxstrm << std::fixed << std::setprecision(0) << points.yMax;
         auto maxstr = maxstrm.str();
-        drawText(maxstr.c_str(), x + hpad, y + title_h + vpad, 2);
+        drawTextFit(maxstr, x + BOX_PAD_X, y + title_h + 6, 64, 2, 1);
 
         std::stringstream minstrm;
         minstrm << std::fixed << std::setprecision(0) << points.yMin;
         auto minstr = minstrm.str();
-        drawText(minstr.c_str(), x + hpad, y + h - (vpad + 7), 2);
+        drawTextFit(minstr, x + BOX_PAD_X, y + h - 13, 64, 2, 1);
 
         if (points.points.size() >= 2) {
             int16_t s_x = 0.0, s_y = 0.0, e_x = 0.0, e_y = 0.0;
@@ -385,113 +510,68 @@ void drawDiscreteBox(int16_t &x, const int16_t &y, const std::string &title,
 { // {{{
     const int16_t w = DISCRETEBOX_WIDTH;
     const int16_t h = DISCRETEBOX_HEIGHT;
-    const int16_t hpad = 8;
-    const int16_t vpad = 8;
 
     if (!title.empty()) {
-        MF_DISPLAY.drawRoundRect(x, y, w, h, 4, FG_COLOR);
-        MF_DISPLAY.drawRoundRect(x + 1, y + 1, w - 2, h - 2, 4, FG_COLOR);
-        // Title at size 3 (18 px/char) on the left; value at size 2
-        // (12 px/char) on the right. The value was previously size 3,
-        // which collided with the title when the value was long — the
-        // worst offender was the STEAM box, whose value is the Steam
-        // client build ID (10 digits, ~180 px wide at size 3 in a 260
-        // px-wide box, well past the title's right edge). size 2 keeps
-        // even a 10-digit value at ~120 px so there is always a visible
-        // gap between the title and the value.
-        drawText(title.c_str(), x + hpad, y + vpad, 3);
-        drawText(value.c_str(),
-                 (x + (w - hpad)) - (12 * strlen(value.c_str())), y + vpad, 2);
+        drawBoxFrame(x, y, w, h);
+        drawBoxTitleValue(x, y + 2, w, title, value, 2);
     }
 
     x += w;
 } // }}}
+
+static void drawHeader()
+{
+    const int16_t w = MF_DISPLAY.width() - HEADER_X - MARGIN;
+    drawTextFit(STATE.topLine, HEADER_X, HEADER_Y, w, 3, 2);
+    drawTextFit(BLE_NAME, HEADER_X, HEADER_Y + 30, w, 2, 1);
+    drawTextFit(STATE.midLine, HEADER_X, HEADER_Y + 51, w, 2, 1);
+    drawTextFit(STATE.botLine, HEADER_X, HEADER_Y + 72, w, 2, 1);
+}
+
+static void drawMetricGrid()
+{
+    int16_t x, y, w, h;
+    for (uint8_t i = 0; i < 9; i++) {
+        boxRectForIndex(i, x, y, w, h);
+        if (i < 3) {
+            drawDiscreteBox(x, y, STATE.keyvals[i].key, STATE.keyvals[i].val);
+        } else {
+            drawSparkbox(x, y, STATE.keyvals[i].key, STATE.keyvals[i].val, STATE.sparks[i - 3]);
+        }
+    }
+}
+
+static std::string footerRightText()
+{
+    if (!STATE.hostMsg.empty() || !STATE.batteryPresent) {
+        return STATE.hostMsg;
+    }
+
+    std::stringstream bat;
+    bat << "BAT " << std::fixed << std::setprecision(2)
+        << ((float)STATE.batteryMv / 1000.0f) << "V";
+    if (STATE.batteryCharging) {
+        bat << " +";
+    }
+    return bat.str();
+}
 
 void drawStatic()
 { // {{{
     int16_t x = 0;
     int16_t y = 0;
 
-    // logo in top left corner
     x = MARGIN;
     y = MARGIN;
     drawLogo(x, y);
+    drawHeader();
+    drawMetricGrid();
 
-    // Header (right of logo, x = 130):
-    //   line 1: STATE.topLine  — size 4, host-controlled headline
-    //           (typically the hostname, e.g. "bazzite")
-    //   line 2: BLE_NAME       — size 3, firmware-controlled device name
-    //           (e.g. "INKTF-A1B2C3"); rendered directly from BLE_NAME
-    //           so it stays visible even when the host pushes its own
-    //           value to STATE.midLine via MIDLINE_UUID.
-    //   line 3: STATE.midLine  — size 3, host-controlled; intended slot
-    //           for the user's Steam display name (sent by Valve's
-    //           Inkterface host app to MIDLINE_UUID).
-    //   line 4: STATE.botLine  — size 3, host-controlled tertiary info
-    //           (typically current activity like "Gaming").
-    //
-    // Vertical budget: 4 lines × 22 px spacing + 6 px top margin = 94 px,
-    // well within the 120 px gap before the first row of boxes.
-    x = 130;
-    y = 12;
-    drawText(STATE.topLine.c_str(), x, y, 4);
-    y += 24;
-    drawText(BLE_NAME.c_str(), x, y, 3);
-    y += 22;
-    drawText(STATE.midLine.c_str(), x, y, 3);
-    y += 22;
-    drawText(STATE.botLine.c_str(), x, y, 3);
-
-    // first row of boxes with no sparklines
-    x = MARGIN;
-    y = 120;
-    drawDiscreteBox(x, y, STATE.keyvals[0].key, STATE.keyvals[0].val);
-    x += GUTTER;
-    drawDiscreteBox(x, y, STATE.keyvals[1].key, STATE.keyvals[1].val);
-    x += GUTTER;
-    drawDiscreteBox(x, y, STATE.keyvals[2].key, STATE.keyvals[2].val);
-
-    // second row
-    x = MARGIN;
-    y += DISCRETEBOX_HEIGHT + GUTTER;
-    drawSparkbox(x, y, STATE.keyvals[3].key, STATE.keyvals[3].val, STATE.sparks[0]);
-    x += GUTTER;
-    drawSparkbox(x, y, STATE.keyvals[4].key, STATE.keyvals[4].val, STATE.sparks[1]);
-    x += GUTTER;
-    drawSparkbox(x, y, STATE.keyvals[5].key, STATE.keyvals[5].val, STATE.sparks[2]);
-
-    // third row
-    x = MARGIN;
-    y += SPARKBOX_HEIGHT + GUTTER;
-    drawSparkbox(x, y, STATE.keyvals[6].key, STATE.keyvals[6].val, STATE.sparks[3]);
-    x += GUTTER;
-    drawSparkbox(x, y, STATE.keyvals[7].key, STATE.keyvals[7].val, STATE.sparks[4]);
-    x += GUTTER;
-    drawSparkbox(x, y, STATE.keyvals[8].key, STATE.keyvals[8].val, STATE.sparks[5]);
-
-    // version tag (left) and host message / battery (right)
     std::stringstream tag;
     tag << BLE_NAME << " " << GIT_REVISION << " " << INTERFACE_VERSION;
-    x = MARGIN;
-    y = MF_DISPLAY.height() - 14;
-    drawText(tag.str().c_str(), x, y, 1);
-
-    // right side: host message (timestamp) when present, otherwise our own
-    // battery reading. We only show battery when there's nothing from the
-    // host so we don't double-print text.
-    std::string right = STATE.hostMsg;
-    if (right.empty() && STATE.batteryPresent) {
-        std::stringstream bat;
-        bat << "BAT " << std::fixed << std::setprecision(2)
-            << ((float)STATE.batteryMv / 1000.0f) << "V";
-        if (STATE.batteryCharging) {
-            bat << " +";
-        }
-        right = bat.str();
-    }
-    // size 1 = 6 px wide per char.
-    x = MF_DISPLAY.width() - (6 * right.length()) - MARGIN;
-    drawText(right.c_str(), x, y, 1);
+    y = MF_DISPLAY.height() - FOOTER_Y_OFFSET;
+    drawTextFit(tag.str(), MARGIN, y, 400, 1, 1);
+    drawTextFitRight(footerRightText(), MF_DISPLAY.width() - MARGIN, y, 360, 1, 1);
 } // }}}
 
 // helper to switch advertising speed
@@ -523,12 +603,12 @@ void drawSleepScreen()
     MF_DISPLAY.setFullWindow();
     MF_DISPLAY.fillScreen(BG_COLOR);
 
-    const int16_t bmpW = 640;
-    const int16_t bmpH = 480;
+    const int16_t bmpW = GABEN_SLEEP_SCREEN_WIDTH;
+    const int16_t bmpH = GABEN_SLEEP_SCREEN_HEIGHT;
     const int16_t x = (MF_DISPLAY.width() - bmpW) / 2;
     const int16_t y = 0;
 
-    MF_DISPLAY.drawBitmap(x, y, sleep_screen_bitmap, bmpW, bmpH, FG_COLOR);
+    MF_DISPLAY.drawBitmap(x, y, gaben_sleep_screen_bitmap, bmpW, bmpH, FG_COLOR);
     MF_DISPLAY.display();
     MF_DISPLAY.hibernate();
 } // }}}
@@ -554,6 +634,7 @@ void exitIdleMode()
 
     Debug.println("leaving idle mode");
     IDLE_MODE = false;
+    DIRTY.markFull();
     setAdvertisingProfile(false);
     DISP_DEBOUNCE = 10; // redraw normal dashboard soon
 } // }}}
@@ -618,17 +699,16 @@ class StatusLineCallbacks : public NimBLECharacteristicCallbacks
             // Status lines span most of the right half of the header.
             // Conservatively mark a generous rect: x from the logo's
             // right edge through the right margin, y covering all four
-            // lines of header text (topLine at y=12, BLE_NAME at y=36,
-            // midLine at y=58, botLine at y=80 — use y=104 to be safe).
-            DIRTY.markPartial(130, 8, MF_DISPLAY.width() - MARGIN, 104);
+            // lines of header text (topLine at y=12, BLE_NAME at y=42,
+            // midLine at y=63, botLine at y=84).
+            markDirtyRect(130, 8, MF_DISPLAY.width() - MARGIN, 104);
 
             // A bare status-line write still has to redraw — the host
             // may push these between flushes (e.g. a transient CPU temp
             // spike), and without bumping the debounce timer the dirty
             // rect would otherwise sit until the next flush. Treat it
             // like a flush for scheduling + idle-exit purposes.
-            exitIdleMode();
-            DISP_DEBOUNCE = 100;
+            scheduleDashboardRefresh();
         }
     }
 } STATUS_CALLBACKS; // }}}
@@ -647,14 +727,15 @@ class KeyValCallbacks : public NimBLECharacteristicCallbacks
         Msg msg;
         if (value.length() == sizeof(Msg)) {
             memcpy(&msg, value.data(), sizeof(Msg));
-            STATE.keyvals[msg.index].key = msg.key;
-            STATE.keyvals[msg.index].val = msg.val;
-            // A single keyval changed — could be a single box. If we
-            // knew the prior index/value we could compute a tight rect;
-            // for simplicity we conservatively mark the whole screen
-            // dirty so the partial-refresh fast path doesn't risk
-            // ghosting from overlapping rectangles after several updates.
-            DIRTY.markFull();
+            if (msg.index >= STATE.keyvals.size()) {
+                Debug.print("got bad keyval index: ");
+                Debug.println(msg.index);
+                return;
+            }
+            STATE.keyvals[msg.index].key = boundedString(msg.key, sizeof(msg.key));
+            STATE.keyvals[msg.index].val = boundedString(msg.val, sizeof(msg.val));
+            markBoxDirty(msg.index);
+            scheduleDashboardRefresh();
         } else {
             Debug.print("got bad keyval write, size: ");
             Debug.println(value.length());
@@ -675,9 +756,19 @@ class VectorCallbacks : public NimBLECharacteristicCallbacks
     void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &conn) override
     {
         std::string value = characteristic->getValue();
-        Msg msg;
-        if (value.length() >= 2) {
-            memcpy(&msg, value.data(), sizeof(Msg));
+        Msg msg{};
+        const size_t headerSize = sizeof(Msg) - sizeof(msg.values);
+        if (value.length() >= headerSize) {
+            memcpy(&msg, value.data(), headerSize);
+            if (msg.index >= STATE.sparks.size() || (msg.count % 2) != 0 ||
+                msg.count > sizeof(msg.values) || value.length() < headerSize + msg.count) {
+                Debug.print("got bad vector metadata, index/count: ");
+                Debug.print(msg.index);
+                Debug.print("/");
+                Debug.println(msg.count);
+                return;
+            }
+            memcpy(msg.values, value.data() + headerSize, msg.count);
             Debug.print("got vector for index (");
             Debug.print(msg.index);
             Debug.print(") with ");
@@ -693,10 +784,8 @@ class VectorCallbacks : public NimBLECharacteristicCallbacks
                 STATE.sparks[msg.index].points.emplace_back(msg.values[i] / 255.0,
                                                             msg.values[i + 1] / 255.0);
             }
-            // New vector data is a structural change to the sparkline
-            // graph; mark the whole screen dirty to avoid ghosting where
-            // the old graph lines cross the new ones.
-            DIRTY.markFull();
+            markBoxDirty(msg.index + 3);
+            scheduleDashboardRefresh();
         } else {
             Debug.print("got bad vectors write, size: ");
             Debug.println(value.length());
@@ -714,18 +803,11 @@ class FlushCallbacks : public NimBLECharacteristicCallbacks
         // here, not its pixel width, so conservatively mark a generous
         // strip from where the hostMsg text starts through the right
         // margin, plus enough height for size-1 text + padding.
-        int16_t msgPxW = (int16_t)(6 * STATE.hostMsg.length());
-        int16_t rightX = (int16_t)MF_DISPLAY.width() - msgPxW - MARGIN;
-        if (rightX < 130) rightX = 130; // don't extend into the BLE_NAME tag
-        DIRTY.markPartial(rightX - 8, MF_DISPLAY.height() - 22,
-                          MF_DISPLAY.width() - MARGIN,
-                          MF_DISPLAY.height() - 2);
+        markFooterDirty();
 
         // any incoming data implies active use, so leave idle mode and
         // redraw the dashboard instead of staying on the sleep screen.
-        exitIdleMode();
-
-        DISP_DEBOUNCE = 100;
+        scheduleDashboardRefresh();
     }
 } FLUSH_CALLBACKS; // }}}
 
@@ -848,12 +930,8 @@ void loop()
             // >=50 mV change is worth redrawing for. Smaller ripples are
             // just ADC noise. The battery text sits in the bottom-right
             // corner; mark a tight rect there for fast partial refresh.
-            int16_t msgPxW = (int16_t)(6 * 18); // "BAT 4.XXV +" worst case
-            int16_t rightX = (int16_t)MF_DISPLAY.width() - msgPxW - MARGIN;
-            if (rightX < 130) rightX = 130;
-            DIRTY.markPartial(rightX - 8, MF_DISPLAY.height() - 22,
-                              MF_DISPLAY.width() - MARGIN,
-                              MF_DISPLAY.height() - 2);
+            markFooterDirty();
+            scheduleActiveRefresh();
         }
         BAT_POLL = BAT_INTERVAL_MS;
     } else {
@@ -896,6 +974,8 @@ void loop()
         Debug.println(DIRTY.full ? "FULL" : "PARTIAL");
         DISP_DEBOUNCE = 0;
 
+        bool wokeDisplay = false;
+
         // while idle, the sleep screen is the source of truth; skip the
         // dashboard redraw entirely (and clear the dirty state so any
         // battery-only change doesn't keep accumulating). exitIdleMode()
@@ -903,9 +983,11 @@ void loop()
         // repaint the dashboard.
         if (!IDLE_MODE) {
             // init() must be called again after hibernate() to wake the panel
-            MF_DISPLAY.init(115200, false, 2, false);
-
-            if (DIRTY.full) {
+            if (!DIRTY.full && DIRTY.empty()) {
+                Debug.println("skipping display refresh, no dirty region");
+            } else if (DIRTY.full) {
+                MF_DISPLAY.init(115200, false, 2, false);
+                wokeDisplay = true;
                 // Full refresh path. Repaint everything in the buffer, push
                 // it to the panel, then clear the dirty state.
                 MF_DISPLAY.setFullWindow();
@@ -913,25 +995,31 @@ void loop()
                 drawStatic();
                 MF_DISPLAY.display();
             } else {
+                MF_DISPLAY.init(115200, false, 2, false);
+                wokeDisplay = true;
                 // Partial refresh path. We use setPartialWindow() to
                 // *clip drawPixel()* to the dirty rect, then re-run
                 // drawStatic(). Every pixel that falls outside the dirty
                 // rect is silently dropped by drawPixel(), so the
                 // buffer is only updated inside the rect — and the
                 // untouched parts of the buffer remain in sync with the
-                // panel from the previous refresh. We deliberately do
-                // NOT call fillScreen() here (it ignores the partial
-                // window and would wipe the whole 48 KB buffer for
-                // nothing).
+                // panel from the previous refresh. Clear just this rect so
+                // shorter replacement text does not leave old pixels behind.
                 int16_t w = (int16_t)(DIRTY.x1 - DIRTY.x0 + 1);
                 int16_t h = (int16_t)(DIRTY.y1 - DIRTY.y0 + 1);
                 int16_t xRounded = DIRTY.x0 & ~0x07;                   // round down to 8
                 int16_t wRounded = (int16_t)(((w + (DIRTY.x0 - xRounded) + 7) & ~0x07)); // round up
+                if (xRounded + wRounded > MF_DISPLAY.width()) {
+                    wRounded = (int16_t)(MF_DISPLAY.width() - xRounded);
+                }
                 MF_DISPLAY.setPartialWindow(xRounded, DIRTY.y0, wRounded, h);
+                MF_DISPLAY.fillRect(xRounded, DIRTY.y0, wRounded, h, BG_COLOR);
                 drawStatic();
                 MF_DISPLAY.displayWindow(xRounded, DIRTY.y0, wRounded, h);
             }
-            MF_DISPLAY.hibernate();
+            if (wokeDisplay) {
+                MF_DISPLAY.hibernate();
+            }
         }
         DIRTY.clear();
         Debug.println("drew to display");
