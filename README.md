@@ -10,18 +10,26 @@ This will only run on Linux based machines (tested on Bazzite).
 
 Note: This is just the firmware, you still have to build the official Valve's app that will connect to the board and send data to it.
 
-Changes to the code:
+## Changes to the code
 - Rewritten to use `GxEPD2` library with built in support for `GxEPD2_583_GDEQ0583T31` panel
 - Completely removed battery logic as the board will be wired to the motherboard's USB port internally.
 - Increased height of the stat tiles from 100 to 150px.
 - Swapped the logo in the top left corner to Bazzite.
-- Added idle mode and sleep screen:
-    - Board draws [TRMNL's sleep screen](https://help.trmnl.com/en/articles/11129379-sleep-mode) after 5 minutes of not being connected over Bluetooth.
-    - Bluetooth advertising remains enabled while idle so the device stays discoverable.
-    - Advertising interval is reduced in idle mode to lower power usage.
-    - Normal dashboard mode is restored automatically when Valve's Interface reconnects and sends fresh data.
+- Added idle mode and sleep screen.
+- Added partial refresh for the dashboard.
+
+### Idle mode & sleep screen
+- Board draws [TRMNL's sleep screen](https://help.trmnl.com/en/articles/11129379-sleep-mode) after 5 minutes of not being connected over Bluetooth.
+- Bluetooth advertising remains enabled while idle so the device stays discoverable.
+- Advertising interval is reduced in idle mode to lower power usage.
+- Normal dashboard mode is restored automatically when Valve's Interface reconnects and sends fresh data.
 
 ![](./docs/reinkterface_sleep_screen.jpg)
+
+### Partial refresh
+- Only the boxes and lines whose values actually changed are redrawn, instead of clearing and redrawing the entire screen on every update.
+- These updates are fast and don't flash the whole panel like a full refresh does.
+- A full screen refresh still happens on startup, on reconnect, and periodically in the background to prevent ghosting from repeated partial updates.
 
 ## Hardware needed
 - Board - [XIAO ePaper Display Board(ESP32-S3) - EE04](https://www.seeedstudio.com/XIAO-ePaper-Display-Board-EE04-p-6560.html)
@@ -67,4 +75,4 @@ After that I rebuilt the app and it started reporting Fan RPM and sending it to 
 ![](./docs/inkterface_fan_rpm.png)
 
 ## Disclaimer
-I have used LLM to speed up the process of rewriting the code and adjusted it afterwards.
+I have used LLMs to speed up the process of rewriting the code and adjusted it afterwards.
