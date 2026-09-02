@@ -31,6 +31,8 @@ Note: This is just the firmware, you still have to build the official Valve's ap
 - These updates are fast and don't flash the whole panel like a full refresh does.
 - A full screen refresh still happens on startup, on reconnect, and periodically in the background to prevent ghosting from repeated partial updates.
 
+![](./docs/reinkterface_partial_refresh.gif)
+
 ## Hardware needed
 - Board - [XIAO ePaper Display Board(ESP32-S3) - EE04](https://www.seeedstudio.com/XIAO-ePaper-Display-Board-EE04-p-6560.html)
 - E-Ink Panel - [Waveshare 5.83" e-ink display 648x480px](https://www.waveshare.com/5.83inch-e-paper.htm)
