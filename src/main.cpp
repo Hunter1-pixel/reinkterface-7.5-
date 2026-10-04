@@ -55,8 +55,6 @@
 #define MARGIN              5
 // Title bar height inside each box; sparkbox graph area = (height - title_h - 32).
 #define SPARKBOX_TITLE_H    32
-#define PANEL_WIDTH         800
-#define PANEL_HEIGHT        480
 #define HEADER_X            130
 #define HEADER_Y            12
 #define BOX_TOP_Y           120
@@ -73,56 +71,9 @@ std::string BLE_NAME = "INKTF";
 // (e.g. to a disabled no-op) in one place if we ever want a quiet build.
 #define Debug Serial
 
-// Dirty-region tracker.
-//
-// The host BLE frame (status lines / keyvals / vectors / flush) redraws
-// the whole panel, which is the natural way to handle a structural
-// change. But the battery readout updates on its own 5 s timer and the
-// only thing that actually changed is a ~120 x 14 px patch in the
-// bottom-right corner. Forcing a full refresh every 5 s for that is
-// wasteful (~1.2 s flicker every poll) and shortens panel life.
-//
-// Instead we keep a bounding box of "regions that have changed since the
-// last refresh". If the host didn't push anything we may have only the
-// battery patch dirty — in that case we use displayWindow() to do a
-// ~450 ms fast partial refresh of just that rect. If the host pushed a
-// new frame we mark the whole screen dirty and do a fast full refresh.
-struct DirtyRegion {
-    bool     full    = true; // true => redraw entire screen
-    // Partial-rect bounds (x0,y0)..(x1,y1) BOTH inclusive. A rect is
-    // "empty" when x0 > x1 or y0 > y1.
-    int16_t  x0 = 0, y0 = 0;
-    int16_t  x1 = -1, y1 = -1;
-
-    void markFull() {
-        full = true;
-    }
-
-    void markPartial(int16_t rx0, int16_t ry0, int16_t rx1, int16_t ry1) {
-        if (full) {
-            // already going to redraw the whole screen — don't bother
-            // expanding a partial rect.
-            return;
-        }
-        if (empty()) {
-            x0 = rx0; y0 = ry0;
-            x1 = rx1; y1 = ry1;
-        } else {
-            if (rx0 < x0) x0 = rx0;
-            if (ry0 < y0) y0 = ry0;
-            if (rx1 > x1) x1 = rx1;
-            if (ry1 > y1) y1 = ry1;
-        }
-    }
-
-    bool empty() const { return x0 > x1 || y0 > y1; }
-
-    void clear() {
-        full = false;
-        x0 = 0; y0 = 0;
-        x1 = -1; y1 = -1;
-    }
-} DIRTY;
+// Any dashboard change repaints the full panel. This avoids stale regions
+// and keeps the 7.5" layout predictable.
+static bool DISPLAY_DIRTY = true;
 
 bool INVERTED = false;
 #define FG_COLOR (INVERTED ? GxEPD_WHITE : GxEPD_BLACK)
@@ -143,8 +94,6 @@ static constexpr uint16_t ADV_ACTIVE_MIN = 160;
 static constexpr uint16_t ADV_ACTIVE_MAX = 320;
 static constexpr uint16_t ADV_IDLE_MIN   = 1600;
 static constexpr uint16_t ADV_IDLE_MAX   = 3200;
-static constexpr int16_t FOOTER_RIGHT_X  = 430;
-
 // track idle state and disconnect timing
 static bool IDLE_MODE = false;
 static unsigned long LAST_DISCONNECT_MS = 0;
@@ -271,13 +220,6 @@ void drawText(const char *text, const int16_t &x = -1, const int16_t &y = -1,
               const uint8_t &size = 1, const bool &wrap = false);
 void exitIdleMode();
 
-static int16_t clampI16(int16_t value, int16_t low, int16_t high)
-{
-    if (value < low) return low;
-    if (value > high) return high;
-    return value;
-}
-
 static int16_t textWidth(const std::string &text, uint8_t size)
 {
     return (int16_t)(text.length() * 6 * size);
@@ -337,14 +279,6 @@ void drawTextFitRight(const std::string &text, int16_t rightX, int16_t y, int16_
     drawText(fitted.c_str(), rightX - textWidth(fitted, size), y, size);
 }
 
-static void markDirtyRect(int16_t x0, int16_t y0, int16_t x1, int16_t y1)
-{
-    DIRTY.markPartial(clampI16(x0, 0, PANEL_WIDTH - 1),
-                      clampI16(y0, 0, PANEL_HEIGHT - 1),
-                      clampI16(x1, 0, PANEL_WIDTH - 1),
-                      clampI16(y1, 0, PANEL_HEIGHT - 1));
-}
-
 static void boxRectForIndex(uint8_t index, int16_t &x, int16_t &y, int16_t &w, int16_t &h)
 {
     uint8_t col = index;
@@ -362,34 +296,22 @@ static void boxRectForIndex(uint8_t index, int16_t &x, int16_t &y, int16_t &w, i
     w = DISCRETEBOX_WIDTH;
 }
 
-static void markBoxDirty(uint8_t index)
+static void markDashboardDirty()
 {
-    if (index >= 9) {
-        DIRTY.markFull();
-        return;
-    }
-
-    int16_t x, y, w, h;
-    boxRectForIndex(index, x, y, w, h);
-    markDirtyRect(x, y, (int16_t)(x + w - 1), (int16_t)(y + h - 1));
-}
-
-static void markFooterDirty()
-{
-    markDirtyRect(FOOTER_RIGHT_X, MF_DISPLAY.height() - 22,
-                  MF_DISPLAY.width() - MARGIN,
-                  MF_DISPLAY.height() - 2);
+    DISPLAY_DIRTY = true;
 }
 
 static void scheduleDashboardRefresh(unsigned long delayMs = 100)
 {
     exitIdleMode();
+    markDashboardDirty();
     DISP_DEBOUNCE = delayMs;
 }
 
 static void scheduleActiveRefresh(unsigned long delayMs = 100)
 {
     if (!IDLE_MODE) {
+        markDashboardDirty();
         DISP_DEBOUNCE = delayMs;
     }
 }
@@ -634,7 +556,7 @@ void exitIdleMode()
 
     Debug.println("leaving idle mode");
     IDLE_MODE = false;
-    DIRTY.markFull();
+    markDashboardDirty();
     setAdvertisingProfile(false);
     DISP_DEBOUNCE = 10; // redraw normal dashboard soon
 } // }}}
@@ -662,7 +584,7 @@ class ServerCallbacks : public NimBLEServerCallbacks
             STATE.reset();
             // Connection state changed; the connecting-screen is a
             // full-screen image, so mark the whole screen dirty.
-            DIRTY.markFull();
+            markDashboardDirty();
 
             // start the idle timeout when the device becomes disconnected.
             LAST_DISCONNECT_MS = millis();
@@ -696,18 +618,6 @@ class StatusLineCallbacks : public NimBLECharacteristicCallbacks
             return;
         }
         if (changed) {
-            // Status lines span most of the right half of the header.
-            // Conservatively mark a generous rect: x from the logo's
-            // right edge through the right margin, y covering all four
-            // lines of header text (topLine at y=12, BLE_NAME at y=42,
-            // midLine at y=63, botLine at y=84).
-            markDirtyRect(130, 8, MF_DISPLAY.width() - MARGIN, 104);
-
-            // A bare status-line write still has to redraw — the host
-            // may push these between flushes (e.g. a transient CPU temp
-            // spike), and without bumping the debounce timer the dirty
-            // rect would otherwise sit until the next flush. Treat it
-            // like a flush for scheduling + idle-exit purposes.
             scheduleDashboardRefresh();
         }
     }
@@ -734,7 +644,6 @@ class KeyValCallbacks : public NimBLECharacteristicCallbacks
             }
             STATE.keyvals[msg.index].key = boundedString(msg.key, sizeof(msg.key));
             STATE.keyvals[msg.index].val = boundedString(msg.val, sizeof(msg.val));
-            markBoxDirty(msg.index);
             scheduleDashboardRefresh();
         } else {
             Debug.print("got bad keyval write, size: ");
@@ -784,7 +693,6 @@ class VectorCallbacks : public NimBLECharacteristicCallbacks
                 STATE.sparks[msg.index].points.emplace_back(msg.values[i] / 255.0,
                                                             msg.values[i + 1] / 255.0);
             }
-            markBoxDirty(msg.index + 3);
             scheduleDashboardRefresh();
         } else {
             Debug.print("got bad vectors write, size: ");
@@ -798,13 +706,6 @@ class FlushCallbacks : public NimBLECharacteristicCallbacks
     void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &conn) override
     {
         STATE.hostMsg = characteristic->getValue();
-        // The host message goes into the bottom-right corner (same slot
-        // as the battery readout). We only know the new value's *length*
-        // here, not its pixel width, so conservatively mark a generous
-        // strip from where the hostMsg text starts through the right
-        // margin, plus enough height for size-1 text + padding.
-        markFooterDirty();
-
         // any incoming data implies active use, so leave idle mode and
         // redraw the dashboard instead of staying on the sleep screen.
         scheduleDashboardRefresh();
@@ -860,8 +761,6 @@ void setup()
 
     Debug.println("initializing display");
     STATE.reset();
-    DIRTY.clear();        // first paint is always full
-    DIRTY.markFull();
     // init(serial_diag_bitrate, initial, reset_duration_ms, pulldown_rst_mode)
     MF_DISPLAY.init(115200, true, 2, false);
     MF_DISPLAY.setFullWindow();
@@ -869,8 +768,8 @@ void setup()
     drawStatic();
     MF_DISPLAY.display();
     MF_DISPLAY.hibernate();
-    DIRTY.clear();
-    DISP_DEBOUNCE = 10;
+    DISPLAY_DIRTY = false;
+    DISP_DEBOUNCE = 0;
 
     Debug.println("starting ble advert");
     uint32_t addr = (uint64_t)NimBLEDevice::getAddress() & 0xFFFFFF;
@@ -928,9 +827,7 @@ void loop()
         if (was_present != STATE.batteryPresent ||
             (STATE.batteryPresent && abs(was_mv - STATE.batteryMv) >= 50)) {
             // >=50 mV change is worth redrawing for. Smaller ripples are
-            // just ADC noise. The battery text sits in the bottom-right
-            // corner; mark a tight rect there for fast partial refresh.
-            markFooterDirty();
+            // just ADC noise.
             scheduleActiveRefresh();
         }
         BAT_POLL = BAT_INTERVAL_MS;
@@ -970,58 +867,23 @@ void loop()
     if (DISP_DEBOUNCE > 0 && DISP_DEBOUNCE > delta) {
         DISP_DEBOUNCE -= delta;
     } else if (DISP_DEBOUNCE > 0) {
-        Debug.print("drawing to display, mode=");
-        Debug.println(DIRTY.full ? "FULL" : "PARTIAL");
+        Debug.println("drawing full dashboard to display");
         DISP_DEBOUNCE = 0;
 
-        bool wokeDisplay = false;
-
         // while idle, the sleep screen is the source of truth; skip the
-        // dashboard redraw entirely (and clear the dirty state so any
+        // dashboard redraw entirely (and clear the dirty flag so any
         // battery-only change doesn't keep accumulating). exitIdleMode()
         // sets DISP_DEBOUNCE = 10, which forces the next iteration to
         // repaint the dashboard.
-        if (!IDLE_MODE) {
-            // init() must be called again after hibernate() to wake the panel
-            if (!DIRTY.full && DIRTY.empty()) {
-                Debug.println("skipping display refresh, no dirty region");
-            } else if (DIRTY.full) {
-                MF_DISPLAY.init(115200, false, 2, false);
-                wokeDisplay = true;
-                // Full refresh path. Repaint everything in the buffer, push
-                // it to the panel, then clear the dirty state.
-                MF_DISPLAY.setFullWindow();
-                MF_DISPLAY.fillScreen(BG_COLOR);
-                drawStatic();
-                MF_DISPLAY.display();
-            } else {
-                MF_DISPLAY.init(115200, false, 2, false);
-                wokeDisplay = true;
-                // Partial refresh path. We use setPartialWindow() to
-                // *clip drawPixel()* to the dirty rect, then re-run
-                // drawStatic(). Every pixel that falls outside the dirty
-                // rect is silently dropped by drawPixel(), so the
-                // buffer is only updated inside the rect — and the
-                // untouched parts of the buffer remain in sync with the
-                // panel from the previous refresh. Clear just this rect so
-                // shorter replacement text does not leave old pixels behind.
-                int16_t w = (int16_t)(DIRTY.x1 - DIRTY.x0 + 1);
-                int16_t h = (int16_t)(DIRTY.y1 - DIRTY.y0 + 1);
-                int16_t xRounded = DIRTY.x0 & ~0x07;                   // round down to 8
-                int16_t wRounded = (int16_t)(((w + (DIRTY.x0 - xRounded) + 7) & ~0x07)); // round up
-                if (xRounded + wRounded > MF_DISPLAY.width()) {
-                    wRounded = (int16_t)(MF_DISPLAY.width() - xRounded);
-                }
-                MF_DISPLAY.setPartialWindow(xRounded, DIRTY.y0, wRounded, h);
-                MF_DISPLAY.fillRect(xRounded, DIRTY.y0, wRounded, h, BG_COLOR);
-                drawStatic();
-                MF_DISPLAY.displayWindow(xRounded, DIRTY.y0, wRounded, h);
-            }
-            if (wokeDisplay) {
-                MF_DISPLAY.hibernate();
-            }
+        if (!IDLE_MODE && DISPLAY_DIRTY) {
+            MF_DISPLAY.init(115200, false, 2, false);
+            MF_DISPLAY.setFullWindow();
+            MF_DISPLAY.fillScreen(BG_COLOR);
+            drawStatic();
+            MF_DISPLAY.display();
+            MF_DISPLAY.hibernate();
         }
-        DIRTY.clear();
+        DISPLAY_DIRTY = false;
         Debug.println("drew to display");
     }
 
