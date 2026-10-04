@@ -14,7 +14,7 @@ Changes to the code (vs. the upstream Waveshare 5.83" build):
 - **Panel:** switched from `GxEPD2_583_GDEQ0583T31` (5.83" 648×480) to `GxEPD2_750_GDEY075T7` (7.5" 800×480, UC8179 / GD7965) — the panel that ships in the TRMNL 7.5" (OG) DIY Kit.
 - **Pin map:** updated to the EE04 / XIAO ESP32-S3 Plus pinout published by TRMNL (CS=44, DC=10, RST=38, BUSY=4, SCK=7, MOSI=9). The kit is wired exactly like that on the PCB.
 - **Board target:** `seeed_xiao_esp32s3` with `BOARD_HAS_PSRAM` and `qio_opi` enabled so the full 48 KB 1 bpp framebuffer lives in OPI PSRAM instead of being paged.
-- **Layout:** re-tuned for the 800×480 canvas and adjusted to keep header lines and box values from overlapping on the larger panel.
+- **Layout:** re-tuned for the 800×480 canvas and adjusted to keep header lines and box values from overlapping on the larger panel, while scaling the content for readability from desk distance.
 - **Refresh:** dashboard updates use full-panel refreshes only to avoid ghosting and stale regions on this device.
 - **Battery logic restored:** the original 5.83" fork removed battery handling because that board was hard-wired to a motherboard's USB header. The TRMNL kit includes a JST-connected 2000 mAh Li-ion cell with a divider on GPIO1 and a load-switch enable on GPIO6. We sample that every 5 s and render `BAT <X.XX>V` in the bottom-right corner when the host message slot is empty.
 - **Swapped the logo in the top-left corner** to Bazzite (unchanged from the 5.83" build — it's still 100×100 px and that lands in the same spot).
@@ -24,7 +24,7 @@ Changes to the code (vs. the upstream Waveshare 5.83" build):
     - Advertising interval is reduced in idle mode (100–200 ms → 1000–2000 ms) to lower power usage.
     - Normal dashboard mode is restored automatically when Valve's Interface reconnects and sends fresh data; a full refresh is forced when the host flushes new data so the sleep image doesn't ghost.
 
-![](./docs/reinkterface_sleep_screen.jpg)
+![](./gaben.png)
 
 ## Hardware needed
 - Board, e-ink panel and battery - https://www.seeedstudio.com/TRMNL-7-5-Inch-OG-DIY-Kit-p-6481.html
